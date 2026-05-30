@@ -22,6 +22,8 @@ from pydantic import BaseModel
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent
 
+from comment_priority import analyze_comment_by_rule, analyze_comment_by_ai, is_system_comment
+
 
 DEFAULT_TIKTOK_USERNAME = "@theunbeatablequeen26"
 
@@ -96,10 +98,20 @@ class StopBody(BaseModel):
     clientId: str
 
 
+class FeedbackBody(BaseModel):
+    clientId: str
+    commentId: str
+    action: str
+    correctedIntent: Optional[str] = None
+    correctedScore: Optional[int] = None
+    note: Optional[str] = None
+
+
 clients: Dict[str, SseClient] = {}
 client_subscriptions: Dict[str, str] = {}
 rooms: Dict[str, TikTokRoom] = {}
 active_sessions: Dict[str, AppLiveSession] = {}
+feedback_events = deque(maxlen=10000)
 
 rooms_lock = asyncio.Lock()
 clients_lock = asyncio.Lock()
@@ -203,9 +215,28 @@ def log(*args, telegram: bool = False):
         telegram_fire_and_forget(line)
 
 
-def make_comment_id(username: str, text: str) -> str:
-    raw = f"{username}:{text}:{time.time_ns()}"
+def normalize_for_dedup(value: str) -> str:
+    return (
+        str(value or "")
+        .lower()
+        .replace("@", "")
+        .replace("\n", " ")
+        .strip()
+    )
+
+
+def make_comment_dedup_key(username: str, text: str) -> str:
+    clean_username = normalize_for_dedup(username)
+    clean_text = normalize_comment_text(text).lower()
+    raw = f"{clean_username}:{clean_text}"
+
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+
+def make_comment_id(username: str, text: str) -> str:
+    # Stable ID: same user + same comment text => same id.
+    # Do not use time.time_ns() here, otherwise duplicate comments appear after reconnect/snapshot/AI update.
+    return make_comment_dedup_key(username, text)
 
 
 def normalize_comment_text(text: str) -> str:
@@ -336,24 +367,307 @@ def get_comment_avatar(user_dict: dict) -> str:
     return extract_url_from_value(avatar_value)
 
 
+def normalize_at_username(value: str) -> str:
+    username = str(value or "").strip()
+
+    if not username:
+        return ""
+
+    return username if username.startswith("@") else f"@{username}"
+
+
+def get_direct_attr(obj: Any, names: list[str]) -> str:
+    if not obj:
+        return ""
+
+    for name in names:
+        try:
+            value = getattr(obj, name, "")
+            if value:
+                return str(value)
+        except Exception:
+            pass
+
+    return ""
+
+
+def get_nested_user_candidates(event: CommentEvent) -> list[Any]:
+    candidates: list[Any] = []
+
+    for attr_name in [
+        "user_info",
+        "userInfo",
+        "author_info",
+        "authorInfo",
+    ]:
+        try:
+            value = getattr(event, attr_name, None)
+            if value:
+                candidates.append(value)
+        except Exception as error:
+            log(f"SKIP EVENT ATTR {attr_name}:", error)
+
+    event_dict = object_to_dict(event)
+
+    if event_dict:
+        for key in [
+            "user_info",
+            "userInfo",
+            "author_info",
+            "authorInfo",
+            "data",
+        ]:
+            value = event_dict.get(key)
+
+            if value:
+                candidates.append(value)
+
+    return [item for item in candidates if item]
+
+def merge_user_dicts(candidates: list[Any]) -> dict:
+    merged: dict = {}
+
+    for candidate in candidates:
+        data = object_to_dict(candidate)
+
+        if data:
+            merged = {
+                **merged,
+                **data,
+            }
+
+    return merged
+
+
+def first_deep_value(candidates: list[Any], keys: list[str]) -> str:
+    for candidate in candidates:
+        direct = get_direct_attr(candidate, keys)
+        if direct:
+            return direct
+
+        data = object_to_dict(candidate)
+        found = deep_find_value(data, keys)
+        if found:
+            return str(found)
+
+    return ""
+
+
+def compact_json(data: Any, max_length: int = 1800) -> str:
+    try:
+        text = json.dumps(data, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(data)
+
+    if len(text) > max_length:
+        return text[:max_length] + "...[truncated]"
+
+    return text
+
+
+def debug_user_payload_if_needed(
+    *,
+    display_name: str,
+    unique_id: str,
+    tiktok_username: str,
+    user_dict: dict,
+):
+    if tiktok_username:
+        return
+
+    log("======= COMMENT USER DEBUG EMPTY USERNAME =======")
+    log("Display name:", display_name)
+    log("Unique ID:", unique_id)
+    log("TikTok username:", tiktok_username)
+    log("User dict keys:", list(user_dict.keys())[:80])
+
+    if os.getenv("DEBUG_TIKTOK_USER_DUMP", "0") == "1":
+        log("User dict dump:", compact_json(user_dict))
+
+    log("================================================")
+
+
+def read_path_value(obj: Any, path: str) -> str:
+    """Read nested attr/dict value, e.g. event.user.nickname."""
+    current = obj
+
+    for part in path.split('.'):
+        if current is None:
+            return ""
+
+        if isinstance(current, dict):
+            current = current.get(part)
+        else:
+            current = getattr(current, part, None)
+
+    if current is None:
+        return ""
+
+    return str(current).strip()
+
+
 def get_comment_user(event: CommentEvent):
-    user_info = getattr(event, "user_info", None)
-    user_dict = object_to_dict(user_info)
+    # Ưu tiên lấy giống code test của anh:
+    # event.user.nickname -> event.comment
+    nickname_from_event_user = get_event_user_nickname_safe(event)
 
-    username = (
-        deep_find_value(user_dict, ["nickname", "nickName", "nick_name"])
-        or deep_find_value(user_dict, ["uniqueId", "unique_id", "display_id"])
-        or "Unknown"
-    )
+    candidates = get_nested_user_candidates(event)
+    user_dict = merge_user_dicts(candidates)
 
-    unique_id = (
-        deep_find_value(user_dict, ["uniqueId", "unique_id", "display_id"])
+    nickname_from_user_info = (
+        first_deep_value(
+            candidates,
+            [
+                "nickname",
+                "nick_name",
+                "nickName",
+                "display_name",
+                "displayName",
+            ],
+        )
         or ""
     )
 
+    unique_id = (
+        first_deep_value(
+            candidates,
+            [
+                "unique_id",
+                "uniqueId",
+                "display_id",
+                "displayId",
+                "username",
+                "user_name",
+                "userName",
+                "sec_uid",
+                "secUid",
+            ],
+        )
+        or ""
+    )
+
+    # Theo yêu cầu của anh: tiktok_username lấy từ nickname
+    profile_username = nickname_from_event_user or nickname_from_user_info or unique_id
+    tiktok_username = normalize_at_username(profile_username)
+
+    display_name = nickname_from_event_user or nickname_from_user_info or unique_id or "Unknown"
     avatar = get_comment_avatar(user_dict)
 
-    return str(username), str(unique_id), str(avatar)
+    log("======= COMMENT USER DEBUG =======")
+    log("event.user.nickname:", nickname_from_event_user or "(empty)")
+    log("user_info nickname:", nickname_from_user_info or "(empty)")
+    log("Display name:", display_name)
+    log("TikTok username:", tiktok_username or "(empty)")
+    log("Unique ID:", unique_id or "(empty)")
+    log("Avatar:", avatar or "(empty)")
+    log("User dict keys:", list(user_dict.keys())[:30])
+    log("==================================")
+
+    return str(display_name), str(unique_id), str(tiktok_username), str(avatar)
+
+def get_event_user_nickname_safe(event: CommentEvent) -> str:
+    try:
+        user = event.user
+        nickname = getattr(user, "nickname", "") or getattr(user, "nick_name", "")
+        return str(nickname or "").strip()
+    except Exception as error:
+        log("READ event.user.nickname ERROR:", error)
+        return ""
+    
+def build_comment_payload(
+    *,
+    username_display: str,
+    unique_id: str,
+    tiktok_username: str,
+    avatar: str,
+    text: str,
+    live_username: str,
+    rule_result: dict,
+) -> dict:
+    created_at = now_iso()
+    stable_user_key = tiktok_username or unique_id or username_display
+    comment_id = make_comment_id(stable_user_key, text)
+
+    return {
+        "id": comment_id,
+        "dedupKey": comment_id,
+
+        # User info
+        "username": username_display,
+        "displayName": username_display,
+        "tiktokUsername": tiktok_username,
+        "uniqueId": unique_id,
+
+        # Avatar
+        "avatar": avatar,
+        "avatarUrl": avatar,
+        "profilePictureUrl": avatar,
+
+        # Comment content
+        "text": text,
+        "comment": text,
+        "rawText": text,
+        "tiktokLiveUsername": live_username,
+
+        # Time
+        "createdAt": created_at,
+
+        # Priority / AI
+        "ruleScore": rule_result["ruleScore"],
+        "aiScore": rule_result["aiScore"],
+        "finalScore": rule_result["finalScore"],
+        "intent": rule_result["intent"],
+        "priorityLevel": rule_result["priorityLevel"],
+        "matchedReasons": rule_result["matchedReasons"],
+        "orderInfo": rule_result["orderInfo"],
+        "missingInfo": rule_result["missingInfo"],
+        "aiStatus": rule_result["aiStatus"],
+        "aiReason": rule_result.get("aiReason", ""),
+    }
+
+
+def add_legacy_aliases(comment: dict) -> dict:
+    return {
+        **comment,
+        "dedup_key": comment.get("dedupKey"),
+        "display_name": comment.get("displayName"),
+        "tiktok_username": comment.get("tiktokUsername"),
+        "unique_id": comment.get("uniqueId"),
+        "avatar_url": comment.get("avatarUrl"),
+        "raw_text": comment.get("rawText"),
+        "created_at": comment.get("createdAt"),
+        "rule_score": comment.get("ruleScore"),
+        "ai_score": comment.get("aiScore"),
+        "final_score": comment.get("finalScore"),
+        "priority_level": comment.get("priorityLevel"),
+        "matched_reasons": comment.get("matchedReasons"),
+        "order_info": comment.get("orderInfo"),
+        "missing_info": comment.get("missingInfo"),
+        "ai_status": comment.get("aiStatus"),
+        "ai_reason": comment.get("aiReason"),
+    }
+
+
+def upsert_latest_comment(room: TikTokRoom, comment: dict):
+    comment_id = comment.get("id")
+    dedup_key = comment.get("dedupKey") or comment.get("dedup_key") or comment_id
+
+    for index, item in enumerate(room.latest_comments):
+        item_key = item.get("dedupKey") or item.get("dedup_key") or item.get("id")
+
+        if item.get("id") == comment_id or item_key == dedup_key:
+            room.latest_comments[index] = {
+                **item,
+                **comment,
+                "updatedAt": now_iso(),
+                "updated_at": now_iso(),
+            }
+            return room.latest_comments[index]
+
+    room.latest_comments.insert(0, comment)
+    del room.latest_comments[MAX_COMMENTS:]
+
+    return comment
 
 
 def live_time_payload(
@@ -590,6 +904,75 @@ async def broadcast_to_room(room: TikTokRoom, event: str, payload: dict):
         await unsubscribe_client(client_id, notify=False, schedule_stop=True, reason="sse_missing")
 
 
+def patch_latest_comment(room: TikTokRoom, comment_id: str, patch: dict):
+    for index, item in enumerate(room.latest_comments):
+        if item.get("id") == comment_id:
+            room.latest_comments[index] = {
+                **item,
+                **patch,
+                "updatedAt": now_iso(),
+                "updated_at": now_iso(),
+            }
+            return room.latest_comments[index]
+
+    return None
+
+
+async def analyze_ai_and_publish_to_room(room: TikTokRoom, comment: dict):
+    try:
+        ai_patch = await analyze_comment_by_ai(comment)
+        patched_comment = patch_latest_comment(room, comment["id"], ai_patch)
+
+        await broadcast_to_room(
+            room,
+            "COMMENT_UPDATED",
+            {
+                "commentId": comment["id"],
+                "comment_id": comment["id"],
+                "patch": ai_patch,
+                "comment": patched_comment,
+                "username": room.username,
+                "createdAt": now_iso(),
+                "created_at": now_iso(),
+            },
+        )
+
+        log(
+            "AI COMMENT UPDATED",
+            "| room:",
+            room.username,
+            "| commentId:",
+            comment["id"],
+            "| finalScore:",
+            ai_patch.get("finalScore"),
+            "| intent:",
+            ai_patch.get("intent"),
+        )
+
+    except Exception as error:
+        error_patch = {
+            "aiStatus": "error",
+            "aiReason": str(error),
+        }
+
+        patch_latest_comment(room, comment["id"], error_patch)
+
+        await broadcast_to_room(
+            room,
+            "COMMENT_UPDATED",
+            {
+                "commentId": comment["id"],
+                "comment_id": comment["id"],
+                "patch": error_patch,
+                "username": room.username,
+                "createdAt": now_iso(),
+                "created_at": now_iso(),
+            },
+        )
+
+        log("AI COMMENT ERROR", "| room:", room.username, "| error:", error)
+
+
 def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
     username = room.username
     client = TikTokLiveClient(unique_id=username)
@@ -622,26 +1005,26 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
             log("COMMENT IGNORED | Empty text")
             return
 
-        username_display, unique_id, avatar = get_comment_user(event)
+        if is_system_comment(text):
+            log("COMMENT IGNORED | System/noise:", text)
+            return
 
-        comment = {
-            "id": make_comment_id(unique_id or username_display, text),
-            "username": username_display,
-            "avatar": avatar,
-            "avatarUrl": avatar,
-            "profilePictureUrl": avatar,
-            "uniqueId": unique_id,
-            "text": text,
-            "comment": text,
-            "raw_text": text,
-            "intent": "buying",
-            "tiktokLiveUsername": username,
-            "createdAt": now_iso(),
-            "created_at": now_iso(),
-        }
+        rule_result = analyze_comment_by_rule(text)
 
-        room.latest_comments.insert(0, comment)
-        del room.latest_comments[MAX_COMMENTS:]
+        username_display, unique_id, tiktok_username, avatar = get_comment_user(event)
+
+        comment = build_comment_payload(
+            username_display=username_display,
+            unique_id=unique_id,
+            tiktok_username=tiktok_username,
+            avatar=avatar,
+            text=text,
+            live_username=username,
+            rule_result=rule_result,
+        )
+        comment = add_legacy_aliases(comment)
+
+        upsert_latest_comment(room, comment)
 
         metrics["total_comments"] += 1
         metrics["comment_timestamps"].append(time.time())
@@ -649,7 +1032,8 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
         log("======================================")
         log("NEW COMMENT")
         log("Live room:", username)
-        log("Username:", username_display)
+        log("Display name:", username_display)
+        log("TikTok username:", tiktok_username or "(empty)")
         log("Unique ID:", unique_id)
         log("Avatar:", avatar)
         log("Text:", text)
@@ -663,6 +1047,7 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
                         "💬 New TikTok LIVE comment",
                         f"LIVE: {username}",
                         f"User: {username_display}",
+                        f"TikTok: {tiktok_username or '(empty)'}",
                         f"Text: {text}",
                         f"Time: {now_iso()}",
                     ]
@@ -670,6 +1055,9 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
             )
 
         await broadcast_to_room(room, "COMMENT", comment)
+
+        if rule_result.get("shouldUseAI"):
+            asyncio.create_task(analyze_ai_and_publish_to_room(room, comment))
 
     @client.on(DisconnectEvent)
     async def on_disconnect(event: DisconnectEvent):
@@ -722,21 +1110,48 @@ async def run_room_collector(room: TikTokRoom):
                         break
 
                 except Exception as error:
-                    error_text = str(error)
-                    log("Check is_live error:", room.username, error_text)
+                    error_text = repr(error)
+
+                    log("ROOM COLLECTOR ERROR:", room.username, error_text, telegram=True)
+
+                    is_sign_api_error = (
+                        "SignAPIError" in error_text
+                        or "SIGN_NOT_200" in error_text
+                        or "status code 500" in error_text
+                        or "status code 503" in error_text
+                        or "503 error occurred" in error_text
+                        or "fetching the webcast URL" in error_text
+                    )
+
+                    if is_sign_api_error:
+                        await broadcast_to_room(
+                            room,
+                            "LIVE_ERROR",
+                            {
+                                "message": "TikTok Sign API đang lỗi, server sẽ tự thử lại sau 10 giây.",
+                                "username": room.username,
+                                "createdAt": now_iso(),
+                                "shouldStop": False,
+                                "retry": True,
+                            },
+                        )
+
+                        log("SIGN API ERROR | RETRY AFTER 10s:", room.username)
+                        await asyncio.sleep(10)
+                        continue
 
                     await broadcast_to_room(
                         room,
                         "LIVE_ERROR",
                         {
-                            "message": error_text,
+                            "message": str(error),
                             "username": room.username,
                             "createdAt": now_iso(),
                             "shouldStop": True,
                         },
                     )
 
-                    log("CHECK LIVE ERROR, STOP COLLECTOR:", room.username)
+                    log("LIVE_ERROR SENT, STOP COLLECTOR:", room.username)
                     break
 
                 if not room.subscribers:
@@ -762,7 +1177,9 @@ async def run_room_collector(room: TikTokRoom):
                     },
                 )
 
-                log("ROOM STOPPED, STOP COLLECTOR:", room.username)
+                log("ROOM STOPPED | RETRY AFTER 10s:", room.username)
+                await asyncio.sleep(10)
+                continue
                 break
 
             except asyncio.CancelledError:
@@ -1076,6 +1493,7 @@ def get_metrics_payload():
         "totalSendError": metrics["total_send_error"],
         "totalClientsConnected": metrics["total_clients_connected"],
         "totalClientsDisconnected": metrics["total_clients_disconnected"],
+        "totalFeedback": len(feedback_events),
         "commentsPerMinute": len(recent_comments),
         "commentsPerSecond": round(len(recent_comments) / 60, 2),
         "avgSendLatencyMs": round(avg_latency, 2),
@@ -1102,7 +1520,57 @@ async def root():
         "subscribe": "POST /subscribe",
         "stop": "POST /stop",
         "metrics": "/metrics",
+        "feedback": "POST /feedback",
     }
+
+
+@app.post("/feedback")
+async def feedback(body: FeedbackBody):
+    """
+    Seller feedback:
+    - created_order: seller tạo đơn từ comment
+    - ignored: seller bỏ qua comment
+    - marked_wrong: seller báo AI/rule đoán sai
+
+    MVP: lưu memory trong RAM.
+    Sau này bạn lưu vào database theo clientId/shopId để app học lại.
+    """
+    if not body.clientId:
+        return {"ok": False, "message": "Missing clientId"}
+
+    if not body.commentId:
+        return {"ok": False, "message": "Missing commentId"}
+
+    payload = {
+        "clientId": body.clientId,
+        "commentId": body.commentId,
+        "action": body.action,
+        "correctedIntent": body.correctedIntent,
+        "correctedScore": body.correctedScore,
+        "note": body.note,
+        "createdAt": now_iso(),
+        "created_at": now_iso(),
+    }
+
+    feedback_events.append(payload)
+
+    await send_to_client(
+        body.clientId,
+        "COMMENT_FEEDBACK_SAVED",
+        payload,
+    )
+
+    log(
+        "COMMENT FEEDBACK SAVED",
+        "| clientId:",
+        body.clientId,
+        "| commentId:",
+        body.commentId,
+        "| action:",
+        body.action,
+    )
+
+    return {"ok": True, "feedback": payload}
 
 
 @app.get("/health")
@@ -1229,6 +1697,7 @@ if __name__ == "__main__":
 
     log("======================================")
     log("STARTING TIKTOK LIVE SSE SERVER", telegram=True)
+    log("Running file:", __file__)
     log("Bind host:", HTTP_HOST)
     log("Port:", HTTP_PORT)
     log("Local URL:", f"http://localhost:{HTTP_PORT}")
@@ -1239,7 +1708,7 @@ if __name__ == "__main__":
     log("======================================")
 
     uvicorn.run(
-        "comment_tiktok_live_sse:app",
+        app,
         host=HTTP_HOST,
         port=HTTP_PORT,
         reload=False,
