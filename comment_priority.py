@@ -452,22 +452,22 @@ def build_missing_info(intent: str, order_info: Dict[str, Any], final_score: int
 
     if intent == "buy":
         if not order_info.get("productName") and not order_info.get("productCode"):
-            missing.append("product")
+            missing.append("Tên sản phẩm")
 
         if not order_info.get("quantity"):
-            missing.append("quantity")
+            missing.append("Số lượng")
 
         if not order_info.get("phone"):
-            missing.append("phone")
+            missing.append("Số điện thoại")
 
-        missing.append("address")
+        missing.append("Địa chỉ")
 
     elif intent in ["ask_price", "ask_stock", "ask_product"]:
         if not order_info.get("productName") and not order_info.get("productCode"):
-            missing.append("product")
+            missing.append("Tên sản phẩm")
 
     elif intent == "ask_shipping":
-        missing.append("address")
+        missing.append("Địa chỉ")
 
     return list(dict.fromkeys(missing))
 
