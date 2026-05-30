@@ -5,13 +5,19 @@ import re
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Optional
+from dotenv import load_dotenv
 
+load_dotenv()
 
 AI_PROVIDER = os.getenv("AI_PROVIDER", "mock").strip().lower()
 AI_ENABLED = os.getenv("AI_ENABLED", "1").strip() == "1"
 AI_MODEL = os.getenv("AI_MODEL", "gpt-4o-mini").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
+print("AI_PROVIDER:", AI_PROVIDER)
+print("AI_ENABLED:", AI_ENABLED)
+print("AI_MODEL:", AI_MODEL)
+print("OPENAI_API_KEY:", "OK" if OPENAI_API_KEY else "MISSING")
 
 SYSTEM_COMMENT_KEYWORDS = [
     "đã tham gia",

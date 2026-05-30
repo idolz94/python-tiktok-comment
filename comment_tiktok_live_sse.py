@@ -23,7 +23,9 @@ from TikTokLive import TikTokLiveClient
 from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent
 
 from comment_priority import analyze_comment_by_rule, analyze_comment_by_ai, is_system_comment
+from dotenv import load_dotenv
 
+load_dotenv()
 
 DEFAULT_TIKTOK_USERNAME = "@theunbeatablequeen26"
 
