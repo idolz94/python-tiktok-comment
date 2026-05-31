@@ -14,6 +14,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Set
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -23,9 +24,10 @@ from TikTokLive import TikTokLiveClient
 from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent
 
 from comment_priority import analyze_comment_by_rule, analyze_comment_by_ai, is_system_comment
-from dotenv import load_dotenv
+
 
 load_dotenv()
+
 
 DEFAULT_TIKTOK_USERNAME = "@theunbeatablequeen26"
 
@@ -51,6 +53,45 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 TELEGRAM_LOG_ALL = os.getenv("TELEGRAM_LOG_ALL", "0").strip() == "1"
 TELEGRAM_SEND_COMMENTS = os.getenv("TELEGRAM_SEND_COMMENTS", "0").strip() == "1"
 TELEGRAM_MAX_LENGTH = 3500
+
+
+TIKTOK_EMOJI_MAP = {
+    "laughcry": "😂",
+    "thanks": "🙏",
+    "smile": "😊",
+    "happy": "😄",
+    "cry": "😭",
+    "angry": "😡",
+    "loveface": "😍",
+    "surprised": "😲",
+    "wow": "😮",
+    "wronged": "🥺",
+    "thinking": "🤔",
+    "cool": "😎",
+    "blink": "😉",
+    "hehe": "😏",
+    "flushed": "😳",
+    "cute": "🥰",
+    "greedy": "🤑",
+    "joyful": "😆",
+    "proud": "😌",
+    "speechless": "😶",
+    "awkward": "😅",
+    "wicked": "😈",
+    "rage": "😤",
+    "sulk": "😒",
+    "drool": "🤤",
+    "complacent": "😌",
+    "lovely": "🥰",
+    "greteeth": "😁",
+    "nap": "😴",
+    "yummy": "😋",
+    "shock": "😱",
+    "slap": "😵",
+    "tears": "😭",
+    "stun": "😵",
+    "cute": "🥰",
+}
 
 
 app = FastAPI(title="TikTok Live SSE Comment Server")
@@ -227,6 +268,20 @@ def normalize_for_dedup(value: str) -> str:
     )
 
 
+def normalize_comment_text(text: str) -> str:
+    return str(text or "").replace("\n", " ").strip()
+
+
+def render_tiktok_emoji_tokens(text: str) -> str:
+    value = str(text or "")
+
+    def replace_token(match):
+        token = match.group(1).strip().lower()
+        return TIKTOK_EMOJI_MAP.get(token, match.group(0))
+
+    return re.sub(r"\[([a-zA-Z0-9_]+)\]", replace_token, value)
+
+
 def make_comment_dedup_key(username: str, text: str) -> str:
     clean_username = normalize_for_dedup(username)
     clean_text = normalize_comment_text(text).lower()
@@ -236,13 +291,9 @@ def make_comment_dedup_key(username: str, text: str) -> str:
 
 
 def make_comment_id(username: str, text: str) -> str:
-    # Stable ID: same user + same comment text => same id.
-    # Do not use time.time_ns() here, otherwise duplicate comments appear after reconnect/snapshot/AI update.
+    # Stable ID: same user + same raw comment text => same id.
+    # Do not use time.time_ns(), otherwise duplicate comments appear after reconnect/snapshot/AI update.
     return make_comment_dedup_key(username, text)
-
-
-def normalize_comment_text(text: str) -> str:
-    return str(text or "").replace("\n", " ").strip()
 
 
 def is_number_comment(text: str) -> bool:
@@ -378,6 +429,10 @@ def normalize_at_username(value: str) -> str:
     return username if username.startswith("@") else f"@{username}"
 
 
+def clean_at_username(value: str) -> str:
+    return str(value or "").strip().replace("@", "")
+
+
 def get_direct_attr(obj: Any, names: list[str]) -> str:
     if not obj:
         return ""
@@ -396,6 +451,8 @@ def get_direct_attr(obj: Any, names: list[str]) -> str:
 def get_nested_user_candidates(event: CommentEvent) -> list[Any]:
     candidates: list[Any] = []
 
+    # Important: do NOT call event.user here.
+    # Some TikTokLive versions crash while converting event.user if the payload contains nickName.
     for attr_name in [
         "user_info",
         "userInfo",
@@ -425,6 +482,7 @@ def get_nested_user_candidates(event: CommentEvent) -> list[Any]:
                 candidates.append(value)
 
     return [item for item in candidates if item]
+
 
 def merge_user_dicts(candidates: list[Any]) -> dict:
     merged: dict = {}
@@ -467,56 +525,56 @@ def compact_json(data: Any, max_length: int = 1800) -> str:
     return text
 
 
-def debug_user_payload_if_needed(
-    *,
-    display_name: str,
-    unique_id: str,
-    tiktok_username: str,
-    user_dict: dict,
-):
-    if tiktok_username:
-        return
+def get_event_user_tiktok_username_safe(event: CommentEvent) -> str:
+    try:
+        user = event.user
 
-    log("======= COMMENT USER DEBUG EMPTY USERNAME =======")
-    log("Display name:", display_name)
-    log("Unique ID:", unique_id)
-    log("TikTok username:", tiktok_username)
-    log("User dict keys:", list(user_dict.keys())[:80])
+        username = (
+            getattr(user, "tiktokUsername", "")
+            or getattr(user, "tiktok_username", "")
+            or getattr(user, "uniqueId", "")
+            or getattr(user, "unique_id", "")
+            or ""
+        )
 
-    if os.getenv("DEBUG_TIKTOK_USER_DUMP", "0") == "1":
-        log("User dict dump:", compact_json(user_dict))
-
-    log("================================================")
-
-
-def read_path_value(obj: Any, path: str) -> str:
-    """Read nested attr/dict value, e.g. event.user.nickname."""
-    current = obj
-
-    for part in path.split('.'):
-        if current is None:
-            return ""
-
-        if isinstance(current, dict):
-            current = current.get(part)
-        else:
-            current = getattr(current, part, None)
-
-    if current is None:
+        return str(username or "").strip()
+    except Exception as error:
+        log("READ event.user.tiktokUsername ERROR:", error)
         return ""
-
-    return str(current).strip()
 
 
 def get_comment_user(event: CommentEvent):
-    # Ưu tiên lấy giống code test của anh:
-    # event.user.nickname -> event.comment
-    nickname_from_event_user = get_event_user_nickname_safe(event)
+    """
+    Return display_name, tiktok_username, avatar.
+
+    Main rule:
+    - tiktok_username comes from TikTokLive user.tiktokUsername if available.
+    - unique_id is not returned to frontend anymore.
+    """
+    tiktok_username_from_event_user = get_event_user_tiktok_username_safe(event)
 
     candidates = get_nested_user_candidates(event)
     user_dict = merge_user_dicts(candidates)
 
-    nickname_from_user_info = (
+    fallback_tiktok_username = (
+        first_deep_value(
+            candidates,
+            [
+                "tiktokUsername",
+                "tiktok_username",
+                "uniqueId",
+                "unique_id",
+                "display_id",
+                "displayId",
+                "username",
+                "user_name",
+                "userName",
+            ],
+        )
+        or ""
+    )
+
+    display_name = (
         first_deep_value(
             candidates,
             [
@@ -527,68 +585,42 @@ def get_comment_user(event: CommentEvent):
                 "displayName",
             ],
         )
-        or ""
+        or tiktok_username_from_event_user
+        or fallback_tiktok_username
+        or "Unknown"
     )
 
-    unique_id = (
-        first_deep_value(
-            candidates,
-            [
-                "unique_id",
-                "uniqueId",
-                "display_id",
-                "displayId",
-                "username",
-                "user_name",
-                "userName",
-                "sec_uid",
-                "secUid",
-            ],
-        )
-        or ""
-    )
-
-    # Theo yêu cầu của anh: tiktok_username lấy từ nickname
-    profile_username = nickname_from_event_user or nickname_from_user_info or unique_id
+    profile_username = tiktok_username_from_event_user or fallback_tiktok_username
     tiktok_username = normalize_at_username(profile_username)
-
-    display_name = nickname_from_event_user or nickname_from_user_info or unique_id or "Unknown"
     avatar = get_comment_avatar(user_dict)
 
     log("======= COMMENT USER DEBUG =======")
-    log("event.user.nickname:", nickname_from_event_user or "(empty)")
-    log("user_info nickname:", nickname_from_user_info or "(empty)")
+    log("event.user.tiktokUsername:", tiktok_username_from_event_user or "(empty)")
     log("Display name:", display_name)
     log("TikTok username:", tiktok_username or "(empty)")
-    log("Unique ID:", unique_id or "(empty)")
     log("Avatar:", avatar or "(empty)")
     log("User dict keys:", list(user_dict.keys())[:30])
     log("==================================")
 
-    return str(display_name), str(unique_id), str(tiktok_username), str(avatar)
+    if not tiktok_username and os.getenv("DEBUG_TIKTOK_USER_DUMP", "0") == "1":
+        log("User dict dump:", compact_json(user_dict))
 
-def get_event_user_nickname_safe(event: CommentEvent) -> str:
-    try:
-        user = event.user
-        nickname = getattr(user, "nickname", "") or getattr(user, "nick_name", "")
-        return str(nickname or "").strip()
-    except Exception as error:
-        log("READ event.user.nickname ERROR:", error)
-        return ""
-    
+    return str(display_name), str(tiktok_username), str(avatar)
+
+
 def build_comment_payload(
     *,
     username_display: str,
-    unique_id: str,
     tiktok_username: str,
     avatar: str,
     text: str,
+    raw_text: str,
     live_username: str,
     rule_result: dict,
 ) -> dict:
     created_at = now_iso()
-    stable_user_key = tiktok_username or unique_id or username_display
-    comment_id = make_comment_id(stable_user_key, text)
+    stable_user_key = tiktok_username or username_display
+    comment_id = make_comment_id(stable_user_key, raw_text or text)
 
     return {
         "id": comment_id,
@@ -598,7 +630,6 @@ def build_comment_payload(
         "username": username_display,
         "displayName": username_display,
         "tiktokUsername": tiktok_username,
-        "uniqueId": unique_id,
 
         # Avatar
         "avatar": avatar,
@@ -606,9 +637,11 @@ def build_comment_payload(
         "profilePictureUrl": avatar,
 
         # Comment content
+        # text/comment = rendered content for frontend UI
+        # rawText = raw TikTok content, e.g. [laughcry][thanks]
         "text": text,
         "comment": text,
-        "rawText": text,
+        "rawText": raw_text,
         "tiktokLiveUsername": live_username,
 
         # Time
@@ -634,7 +667,6 @@ def add_legacy_aliases(comment: dict) -> dict:
         "dedup_key": comment.get("dedupKey"),
         "display_name": comment.get("displayName"),
         "tiktok_username": comment.get("tiktokUsername"),
-        "unique_id": comment.get("uniqueId"),
         "avatar_url": comment.get("avatarUrl"),
         "raw_text": comment.get("rawText"),
         "created_at": comment.get("createdAt"),
@@ -1000,27 +1032,27 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
 
     @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
-        raw_text = getattr(event, "comment", "") or ""
-        text = normalize_comment_text(raw_text)
+        raw_text = normalize_comment_text(getattr(event, "comment", "") or "")
+        text = normalize_comment_text(render_tiktok_emoji_tokens(raw_text))
 
-        if not text:
+        if not raw_text:
             log("COMMENT IGNORED | Empty text")
             return
 
-        if is_system_comment(text):
-            log("COMMENT IGNORED | System/noise:", text)
+        if is_system_comment(raw_text) or is_system_comment(text):
+            log("COMMENT IGNORED | System/noise:", raw_text)
             return
 
         rule_result = analyze_comment_by_rule(text)
 
-        username_display, unique_id, tiktok_username, avatar = get_comment_user(event)
+        username_display, tiktok_username, avatar = get_comment_user(event)
 
         comment = build_comment_payload(
             username_display=username_display,
-            unique_id=unique_id,
             tiktok_username=tiktok_username,
             avatar=avatar,
             text=text,
+            raw_text=raw_text,
             live_username=username,
             rule_result=rule_result,
         )
@@ -1036,9 +1068,9 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
         log("Live room:", username)
         log("Display name:", username_display)
         log("TikTok username:", tiktok_username or "(empty)")
-        log("Unique ID:", unique_id)
         log("Avatar:", avatar)
         log("Text:", text)
+        log("Raw text:", raw_text)
         log("Subscribers:", len(room.subscribers))
         log("======================================")
 
@@ -1051,6 +1083,7 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
                         f"User: {username_display}",
                         f"TikTok: {tiktok_username or '(empty)'}",
                         f"Text: {text}",
+                        f"Raw text: {raw_text}",
                         f"Time: {now_iso()}",
                     ]
                 )
@@ -1114,7 +1147,7 @@ async def run_room_collector(room: TikTokRoom):
                 except Exception as error:
                     error_text = repr(error)
 
-                    log("ROOM COLLECTOR ERROR:", room.username, error_text, telegram=True)
+                    log("CHECK LIVE ERROR:", room.username, error_text, telegram=True)
 
                     is_sign_api_error = (
                         "SignAPIError" in error_text
@@ -1122,6 +1155,7 @@ async def run_room_collector(room: TikTokRoom):
                         or "status code 500" in error_text
                         or "status code 503" in error_text
                         or "503 error occurred" in error_text
+                        or "500 error occurred" in error_text
                         or "fetching the webcast URL" in error_text
                     )
 
@@ -1175,14 +1209,14 @@ async def run_room_collector(room: TikTokRoom):
                         "message": "TikTokLive room stopped",
                         "username": room.username,
                         "createdAt": now_iso(),
-                        "shouldStop": True,
+                        "shouldStop": False,
+                        "retry": True,
                     },
                 )
 
                 log("ROOM STOPPED | RETRY AFTER 10s:", room.username)
                 await asyncio.sleep(10)
                 continue
-                break
 
             except asyncio.CancelledError:
                 log("ROOM COLLECTOR CANCELLED:", room.username)
@@ -1192,6 +1226,33 @@ async def run_room_collector(room: TikTokRoom):
                 error_text = repr(error)
 
                 log("ROOM COLLECTOR ERROR:", room.username, error_text, telegram=True)
+
+                is_retryable_error = (
+                    "SignAPIError" in error_text
+                    or "SIGN_NOT_200" in error_text
+                    or "status code 500" in error_text
+                    or "status code 503" in error_text
+                    or "503 error occurred" in error_text
+                    or "500 error occurred" in error_text
+                    or "fetching the webcast URL" in error_text
+                )
+
+                if is_retryable_error:
+                    await broadcast_to_room(
+                        room,
+                        "LIVE_ERROR",
+                        {
+                            "message": "TikTok Sign API đang lỗi, server sẽ tự thử lại sau 10 giây.",
+                            "username": room.username,
+                            "createdAt": now_iso(),
+                            "shouldStop": False,
+                            "retry": True,
+                        },
+                    )
+
+                    log("RETRYABLE ROOM ERROR | RETRY AFTER 10s:", room.username)
+                    await asyncio.sleep(10)
+                    continue
 
                 await broadcast_to_room(
                     room,
@@ -1528,15 +1589,6 @@ async def root():
 
 @app.post("/feedback")
 async def feedback(body: FeedbackBody):
-    """
-    Seller feedback:
-    - created_order: seller tạo đơn từ comment
-    - ignored: seller bỏ qua comment
-    - marked_wrong: seller báo AI/rule đoán sai
-
-    MVP: lưu memory trong RAM.
-    Sau này bạn lưu vào database theo clientId/shopId để app học lại.
-    """
     if not body.clientId:
         return {"ok": False, "message": "Missing clientId"}
 
