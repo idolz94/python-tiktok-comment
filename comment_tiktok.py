@@ -10,6 +10,7 @@ import re
 import socket
 import sqlite3
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -540,20 +541,117 @@ def get_comment_avatar(user_dict: dict) -> str:
     return extract_url_from_value(avatar_value)
 
 
-def get_event_user_tiktok_username_safe(event: CommentEvent) -> str:
-    try:
-        user = event.user
-        username = (
-            getattr(user, "tiktokUsername", "")
-            or getattr(user, "tiktok_username", "")
-            or getattr(user, "uniqueId", "")
-            or getattr(user, "unique_id", "")
-            or ""
+def extract_comment_text(event: CommentEvent) -> str:
+    """
+    Lấy text comment từ nhiều nguồn khác nhau.
+
+    Không chỉ phụ thuộc event.comment, vì một số payload TikTokLive có thể
+    đổi field hoặc comment text nằm sâu trong raw event. Hàm này ưu tiên
+    direct field trước, sau đó fallback đọc sâu trong raw dict.
+    """
+    direct_candidates = [
+        "comment",
+        "text",
+        "content",
+        "message",
+        "display_text",
+        "displayText",
+    ]
+
+    for attr_name in direct_candidates:
+        try:
+            value = getattr(event, attr_name, "")
+            value = normalize_comment_text(value)
+            if value:
+                return value
+        except Exception:
+            pass
+
+    event_dict = object_to_dict(event)
+
+    # Ưu tiên các nhánh hay chứa nội dung comment trước để tránh nhầm sang
+    # text/bio/nickname trong user payload.
+    preferred_parent_keys = [
+        "comment",
+        "commentInfo",
+        "comment_info",
+        "message",
+        "messageInfo",
+        "message_info",
+        "content",
+        "data",
+    ]
+
+    for parent_key in preferred_parent_keys:
+        parent_value = event_dict.get(parent_key) if isinstance(event_dict, dict) else None
+        if not parent_value:
+            continue
+
+        if isinstance(parent_value, str):
+            value = normalize_comment_text(parent_value)
+            if value:
+                return value
+
+        found = deep_find_value(
+            parent_value,
+            [
+                "comment",
+                "text",
+                "content",
+                "message",
+                "display_text",
+                "displayText",
+            ],
         )
-        return str(username or "").strip()
-    except Exception as error:
-        log("READ event.user.tiktokUsername ERROR:", error)
-        return ""
+        found = normalize_comment_text(found)
+        if found:
+            return found
+
+    found = deep_find_value(
+        event_dict,
+        [
+            "comment",
+            "text",
+            "content",
+            "message",
+            "display_text",
+            "displayText",
+        ],
+    )
+    found = normalize_comment_text(found)
+
+    return found or ""
+
+
+def get_event_user_tiktok_username_safe(event: CommentEvent) -> str:
+    """
+    Không gọi event.user.
+
+    Một số version TikTokLive bị lỗi khi parse user payload có key camelCase
+    như nickName, dẫn tới lỗi:
+        User.__init__() got an unexpected keyword argument 'nickName'
+
+    Vì vậy chỉ đọc từ raw candidates/user_info/author_info/data.
+    """
+    candidates = get_nested_user_candidates(event)
+    username = (
+        first_deep_value(
+            candidates,
+            [
+                "tiktokUsername",
+                "tiktok_username",
+                "uniqueId",
+                "unique_id",
+                "display_id",
+                "displayId",
+                "username",
+                "user_name",
+                "userName",
+            ],
+        )
+        or ""
+    )
+    return str(username or "").strip()
 
 
 def get_comment_user(event: CommentEvent) -> tuple[str, str, str]:
@@ -753,8 +851,17 @@ def build_comment_payload(
 
 
 def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(OUTBOX_DB_PATH)
+    # Mỗi lần mở connection riêng để dùng an toàn với asyncio.to_thread.
+    # WAL + busy_timeout giúp giảm lỗi database is locked khi comment nhiều.
+    conn = sqlite3.connect(
+        OUTBOX_DB_PATH,
+        timeout=30,
+        isolation_level=None,
+    )
     conn.row_factory = sqlite3.Row
+    conn.execute("pragma journal_mode=WAL")
+    conn.execute("pragma synchronous=NORMAL")
+    conn.execute("pragma busy_timeout=30000")
     return conn
 
 
@@ -778,7 +885,9 @@ def init_outbox_db_sync():
         conn.execute(
             "create index if not exists idx_outbox_pending on outbox_events(delivered_at, created_at)"
         )
-        conn.commit()
+        conn.execute(
+            "create index if not exists idx_outbox_attempts on outbox_events(delivered_at, attempts, created_at)"
+        )
     finally:
         conn.close()
 
@@ -790,12 +899,15 @@ async def init_outbox_db():
 def enqueue_outbox_event_sync(event_type: str, payload: dict):
     event_id = str(payload.get("eventId") or str(uuid.uuid4()))
     now = now_iso()
+    payload_json = json.dumps(payload, ensure_ascii=False, default=str)
 
     conn = db_connect()
     try:
+        # Idempotent insert. Nếu event đã tồn tại nhưng chưa gửi, cập nhật payload mới nhất
+        # và giữ attempts để worker tiếp tục retry. Nếu đã delivered rồi thì không tạo lại.
         conn.execute(
             """
-            insert or ignore into outbox_events (
+            insert into outbox_events (
                 id,
                 event_type,
                 payload_json,
@@ -803,10 +915,14 @@ def enqueue_outbox_event_sync(event_type: str, payload: dict):
                 created_at,
                 updated_at
             ) values (?, ?, ?, 0, ?, ?)
+            on conflict(id) do update set
+                payload_json = excluded.payload_json,
+                event_type = excluded.event_type,
+                updated_at = excluded.updated_at
+            where outbox_events.delivered_at is null
             """,
-            (event_id, event_type, json.dumps(payload, ensure_ascii=False, default=str), now, now),
+            (event_id, event_type, payload_json, now, now),
         )
-        conn.commit()
     finally:
         conn.close()
 
@@ -916,17 +1032,28 @@ def post_json_sync(url: str, payload: dict) -> dict:
         "User-Agent": "tiktok-python-collector/1.0",
     }
 
+    event_id = str(payload.get("eventId") or "").strip()
+    if event_id:
+        # Node có thể dùng header này để idempotency/dedupe.
+        headers["x-event-id"] = event_id
+
     if NODE_INTERNAL_API_KEY:
         headers["x-internal-api-key"] = NODE_INTERNAL_API_KEY
 
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
 
-    with urllib.request.urlopen(request, timeout=NODE_REQUEST_TIMEOUT) as response:
-        response_body = response.read().decode("utf-8")
-        status_code = response.getcode()
+    try:
+        with urllib.request.urlopen(request, timeout=NODE_REQUEST_TIMEOUT) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            status_code = response.getcode()
+    except urllib.error.HTTPError as error:
+        response_body = error.read().decode("utf-8", errors="replace") if error.fp else ""
+        raise RuntimeError(f"Node returned HTTP {error.code}: {response_body[:800]}") from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Cannot connect to Node: {error}") from error
 
     if status_code < 200 or status_code >= 300:
-        raise RuntimeError(f"Node returned HTTP {status_code}: {response_body[:500]}")
+        raise RuntimeError(f"Node returned HTTP {status_code}: {response_body[:800]}")
 
     if not response_body:
         return {"ok": True}
@@ -1151,11 +1278,17 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
 
     @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
-        raw_text = normalize_comment_text(getattr(event, "comment", "") or "")
+        raw_text = extract_comment_text(event)
         text = normalize_comment_text(render_tiktok_emoji_tokens(raw_text))
 
         if not raw_text:
+            event_dict = object_to_dict(event)
             log("COMMENT IGNORED | Empty text")
+            log("RAW EVENT KEYS:", list(event_dict.keys())[:50] if isinstance(event_dict, dict) else [])
+            log(
+                "RAW EVENT COMPACT:",
+                json.dumps(compact_raw_payload(event_dict, 1500), ensure_ascii=False, default=str),
+            )
             return
 
         if is_system_comment(raw_text) or is_system_comment(text):
