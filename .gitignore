@@ -3,3 +3,5 @@ __pycache__/
 tiktok_browser_profile/
 *.log
 .env
+CLAUDE.md
+.claude

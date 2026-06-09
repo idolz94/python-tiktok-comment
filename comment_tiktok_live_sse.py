@@ -109,9 +109,6 @@ TELEGRAM_MAX_LENGTH = 3500
 HAS_NUMBER_RE = re.compile(r"\d")
 
 SYSTEM_COMMENT_PATTERNS = [
-    "đã tham gia",
-    "da tham gia",
-    "joined",
     "đã chia sẻ",
     "da chia se",
     "shared",
@@ -122,6 +119,13 @@ SYSTEM_COMMENT_PATTERNS = [
     "followed the host",
     "sent likes",
     "welcome to",
+]
+
+# Patterns cho join events (sẽ gửi như event riêng)
+JOIN_COMMENT_PATTERNS = [
+    "đã tham gia",
+    "da tham gia",
+    "joined",
 ]
 
 TIKTOK_EMOJI_MAP = {
@@ -280,6 +284,13 @@ def is_system_comment(text: str) -> bool:
     if not value:
         return True
     return any(pattern in value for pattern in SYSTEM_COMMENT_PATTERNS)
+
+
+def is_join_event(text: str) -> bool:
+    value = normalize_comment_text(text).lower()
+    if not value:
+        return False
+    return any(pattern in value for pattern in JOIN_COMMENT_PATTERNS)
 
 
 def is_number_comment(text: str) -> bool:
@@ -1291,6 +1302,41 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
             )
             return
 
+        display_name, tiktok_username, avatar_url = get_comment_user(event)
+
+        # Check nếu là join event
+        if is_join_event(raw_text) or is_join_event(text):
+            created_at = now_iso()
+            event_id = make_hash_id(room.username, "USER_JOINED", tiktok_username or display_name, created_at)
+
+            join_payload = {
+                "eventId": event_id,
+                "eventType": "USER_JOINED",
+                "source": "python-tiktok-collector",
+                "shopId": room.shop_id or None,
+                "liveUsername": room.username,
+                "liveSessionId": room.live_session_id or None,
+                "collectorSessionId": room.collector_session_id,
+                "tiktokUsername": tiktok_username,
+                "displayName": display_name,
+                "avatarUrl": avatar_url,
+                "joinText": text,
+                "rawText": raw_text,
+                "createdAt": created_at,
+            }
+
+            await enqueue_outbox_event("USER_JOINED", join_payload)
+
+            log("======================================")
+            log("USER JOINED EVENT QUEUED TO NODE")
+            log("Live room:", username)
+            log("Display name:", display_name)
+            log("TikTok username:", tiktok_username or "(empty)")
+            log("Join text:", text)
+            log("eventId:", event_id)
+            log("======================================")
+            return
+
         if is_system_comment(raw_text) or is_system_comment(text):
             log("COMMENT IGNORED | System/noise:", raw_text)
             return
@@ -1298,8 +1344,6 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
         if ONLY_NUMBER_COMMENTS and not is_number_comment(text):
             log("COMMENT IGNORED | No number:", text)
             return
-
-        display_name, tiktok_username, avatar_url = get_comment_user(event)
 
         payload = build_comment_payload(
             room=room,
