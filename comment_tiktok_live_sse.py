@@ -939,13 +939,14 @@ def enqueue_outbox_event_sync(event_type: str, payload: dict):
 
 
 async def enqueue_outbox_event(event_type: str, payload: dict):
-    if event_type != "COMMENT" and not NODE_EVENT_INGEST_URL:
+    # Gửi COMMENT và USER_JOINED qua comment ingest URL
+    if event_type not in ("COMMENT", "USER_JOINED") and not NODE_EVENT_INGEST_URL:
         # Không cấu hình event URL thì bỏ qua status event để outbox không bị pending mãi.
         return
 
     await asyncio.to_thread(enqueue_outbox_event_sync, event_type, payload)
 
-    if event_type == "COMMENT":
+    if event_type in ("COMMENT", "USER_JOINED"):
         metrics["total_comments_enqueued"] += 1
 
 
@@ -1081,7 +1082,11 @@ def post_json_sync(url: str, payload: dict) -> dict:
 
 
 async def post_to_node(event_type: str, payload: dict) -> dict:
-    url = NODE_COMMENT_INGEST_URL if event_type == "COMMENT" else NODE_EVENT_INGEST_URL
+    # Gửi COMMENT và USER_JOINED qua cùng endpoint comment ingest
+    if event_type in ("COMMENT", "USER_JOINED"):
+        url = NODE_COMMENT_INGEST_URL
+    else:
+        url = NODE_EVENT_INGEST_URL
     return await asyncio.to_thread(post_json_sync, url, payload)
 
 
