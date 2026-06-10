@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from TikTokLive import TikTokLiveClient
-from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent
+from TikTokLive.events import CommentEvent, ConnectEvent, DisconnectEvent, JoinEvent
 
 
 """
@@ -263,6 +263,10 @@ def normalize_at_username(value: str) -> str:
     if not username:
         return ""
     return username if username.startswith("@") else f"@{username}"
+
+
+def normalize_unique_id(value: str) -> str:
+    return str(value or "").strip().lstrip("@")
 
 
 def normalize_comment_text(text: str) -> str:
@@ -782,10 +786,14 @@ def build_comment_payload(
 
     event_id = make_hash_id(room.username, external_comment_id)
     event_dict = object_to_dict(event)
+    tiktok_unique_id = normalize_unique_id(tiktok_username)
+    has_number = is_number_comment(text)
 
     comment = {
         "id": external_comment_id,
         "externalCommentId": external_comment_id,
+        "tiktokCommentId": external_comment_id,
+        "tiktok_comment_id": external_comment_id,
         "dedupKey": event_id,
         "shopId": room.shop_id or None,
         "shop_id": room.shop_id or None,
@@ -796,6 +804,8 @@ def build_comment_payload(
 
         "tiktokUsername": tiktok_username,
         "tiktok_username": tiktok_username,
+        "tiktokUniqueId": tiktok_unique_id,
+        "tiktok_unique_id": tiktok_unique_id,
 
         "avatar": avatar_url,
         "avatarUrl": avatar_url,
@@ -821,6 +831,10 @@ def build_comment_payload(
         "priority_level": "normal",
         "finalScore": 0,
         "final_score": 0,
+        "hasNumber": has_number,
+        "has_number": has_number,
+        "canCreateOrder": False,
+        "can_create_order": False,
         "isOrderCreated": False,
         "is_order_created": False,
     }
@@ -838,6 +852,10 @@ def build_comment_payload(
 
         # Flat fields cho Node map vào DB nhanh.
         "tiktokUsername": tiktok_username,
+        "tiktokUniqueId": tiktok_unique_id,
+        "tiktok_unique_id": tiktok_unique_id,
+        "tiktokCommentId": external_comment_id,
+        "tiktok_comment_id": external_comment_id,
         "displayName": display_name,
         "avatarUrl": avatar_url,
         "commentText": text,
@@ -845,6 +863,10 @@ def build_comment_payload(
         "intent": "normal",
         "priorityLevel": "normal",
         "finalScore": 0,
+        "hasNumber": has_number,
+        "has_number": has_number,
+        "canCreateOrder": False,
+        "can_create_order": False,
         "isOrderCreated": False,
         "createdAt": created_at,
 
@@ -939,14 +961,13 @@ def enqueue_outbox_event_sync(event_type: str, payload: dict):
 
 
 async def enqueue_outbox_event(event_type: str, payload: dict):
-    # Gửi COMMENT và USER_JOINED qua comment ingest URL
-    if event_type not in ("COMMENT", "USER_JOINED") and not NODE_EVENT_INGEST_URL:
+    if event_type != "COMMENT" and not NODE_EVENT_INGEST_URL:
         # Không cấu hình event URL thì bỏ qua status event để outbox không bị pending mãi.
         return
 
     await asyncio.to_thread(enqueue_outbox_event_sync, event_type, payload)
 
-    if event_type in ("COMMENT", "USER_JOINED"):
+    if event_type == "COMMENT":
         metrics["total_comments_enqueued"] += 1
 
 
@@ -1082,12 +1103,20 @@ def post_json_sync(url: str, payload: dict) -> dict:
 
 
 async def post_to_node(event_type: str, payload: dict) -> dict:
-    # Gửi COMMENT và USER_JOINED qua cùng endpoint comment ingest
-    if event_type in ("COMMENT", "USER_JOINED"):
-        url = NODE_COMMENT_INGEST_URL
-    else:
-        url = NODE_EVENT_INGEST_URL
+    url = NODE_COMMENT_INGEST_URL if event_type == "COMMENT" else NODE_EVENT_INGEST_URL
     return await asyncio.to_thread(post_json_sync, url, payload)
+
+
+async def send_realtime_live_event(event_type: str, payload: dict):
+    if not NODE_EVENT_INGEST_URL:
+        log("LIVE EVENT IGNORED | NODE_EVENT_INGEST_URL is not configured:", event_type)
+        return
+
+    try:
+        await post_to_node(event_type, payload)
+    except Exception as exc:
+        metrics["total_node_send_error"] += 1
+        log("LIVE EVENT SEND ERROR", "| eventType:", event_type, "| error:", exc)
 
 
 async def delivery_worker():
@@ -1292,6 +1321,47 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
             },
         )
 
+    @client.on(JoinEvent)
+    async def on_join(event: JoinEvent):
+        try:
+            nickname = getattr(event.user, "nickname", None) or getattr(event.user, "display_id", None) or ""
+            unique_id = getattr(event.user, "unique_id", None) or getattr(event.user, "display_id", None) or ""
+            avatar_url = ""
+            try:
+                avatar_url = str(event.user.avatar_thumb.urls[0]) if event.user.avatar_thumb and event.user.avatar_thumb.urls else ""
+            except Exception:
+                pass
+
+            created_at = now_iso()
+            event_id = make_hash_id(room.username, "USER_JOINED", unique_id or nickname, created_at)
+
+            join_payload = {
+                "eventId": event_id,
+                "eventType": "USER_JOINED",
+                "source": "python-tiktok-collector",
+                "shopId": room.shop_id or None,
+                "liveUsername": room.username,
+                "liveSessionId": room.live_session_id or None,
+                "collectorSessionId": room.collector_session_id,
+                "joinUsername": unique_id,
+                "joinDisplayName": nickname,
+                "joinAvatarUrl": avatar_url,
+                "nickname": nickname,
+                "createdAt": created_at,
+            }
+
+            await send_realtime_live_event("USER_JOINED", join_payload)
+
+            log("======================================")
+            log("USER JOINED (native JoinEvent)")
+            log("Live room:", username)
+            log("Nickname:", nickname)
+            log("TikTok unique_id:", unique_id or "(empty)")
+            log("eventId:", event_id)
+            log("======================================")
+        except Exception as exc:
+            log("JoinEvent handler error:", exc)
+
     @client.on(CommentEvent)
     async def on_comment(event: CommentEvent):
         raw_text = extract_comment_text(event)
@@ -1322,18 +1392,19 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
                 "liveUsername": room.username,
                 "liveSessionId": room.live_session_id or None,
                 "collectorSessionId": room.collector_session_id,
-                "tiktokUsername": tiktok_username,
-                "displayName": display_name,
-                "avatarUrl": avatar_url,
+                "joinUsername": tiktok_username,
+                "joinDisplayName": display_name,
+                "joinAvatarUrl": avatar_url,
+                "nickname": display_name,
                 "joinText": text,
                 "rawText": raw_text,
                 "createdAt": created_at,
             }
 
-            await enqueue_outbox_event("USER_JOINED", join_payload)
+            await send_realtime_live_event("USER_JOINED", join_payload)
 
             log("======================================")
-            log("USER JOINED EVENT QUEUED TO NODE")
+            log("USER JOINED EVENT SENT TO NODE")
             log("Live room:", username)
             log("Display name:", display_name)
             log("TikTok username:", tiktok_username or "(empty)")
