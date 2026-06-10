@@ -1328,7 +1328,7 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
             unique_id = getattr(event.user, "unique_id", None) or getattr(event.user, "display_id", None) or ""
             avatar_url = ""
             try:
-                avatar_url = str(event.user.avatar_thumb.urls[0]) if event.user.avatar_thumb and event.user.avatar_thumb.urls else ""
+                avatar_url = str(event.user.avatar_thumb.m_urls[0])
             except Exception:
                 pass
 
