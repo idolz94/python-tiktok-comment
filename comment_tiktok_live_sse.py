@@ -8,7 +8,6 @@ import json
 import os
 import re
 import socket
-import sqlite3
 import time
 import urllib.error
 import urllib.parse
@@ -45,8 +44,8 @@ Python chỉ còn nhiệm vụ:
     - Lấy comment TikTok
     - Lọc comment hệ thống/noise
     - Chuẩn hóa payload comment
-    - Ghi outbox SQLite trước khi gửi để giảm rủi ro miss comment
-    - Retry gửi sang Node.js nếu Node/mạng lỗi
+    - Gửi comment và live event trực tiếp sang Node.js
+    - Log lỗi rõ ràng nếu Node/mạng lỗi
 """
 
 
@@ -83,11 +82,6 @@ NODE_INTERNAL_API_KEY = os.getenv("NODE_INTERNAL_API_KEY", "").strip()
 COLLECTOR_CONTROL_API_KEY = os.getenv("COLLECTOR_CONTROL_API_KEY", "").strip()
 
 NODE_REQUEST_TIMEOUT = int(os.getenv("NODE_REQUEST_TIMEOUT", "8"))
-
-OUTBOX_DB_PATH = os.getenv("OUTBOX_DB_PATH", "./tiktok_node_outbox.sqlite3")
-OUTBOX_BATCH_SIZE = int(os.getenv("OUTBOX_BATCH_SIZE", "50"))
-OUTBOX_RETRY_INTERVAL = float(os.getenv("OUTBOX_RETRY_INTERVAL", "2"))
-OUTBOX_MAX_ATTEMPTS = int(os.getenv("OUTBOX_MAX_ATTEMPTS", "0"))  # 0 = retry mãi
 
 MAX_LATEST_COMMENTS = int(os.getenv("MAX_LATEST_COMMENTS", "200"))
 ONLY_NUMBER_COMMENTS = os.getenv("ONLY_NUMBER_COMMENTS", "0").strip() == "1"
@@ -230,7 +224,6 @@ class LegacyStopBody(BaseModel):
 
 rooms: Dict[str, TikTokRoom] = {}
 rooms_lock = asyncio.Lock()
-delivery_task: Optional[asyncio.Task] = None
 
 metrics = {
     "started_at": time.time(),
@@ -879,180 +872,26 @@ def build_comment_payload(
 
 
 # =========================
-# OUTBOX SQLITE
+# LIVE EVENT SENDER
 # =========================
 
 
-def db_connect() -> sqlite3.Connection:
-    # Mỗi lần mở connection riêng để dùng an toàn với asyncio.to_thread.
-    # WAL + busy_timeout giúp giảm lỗi database is locked khi comment nhiều.
-    conn = sqlite3.connect(
-        OUTBOX_DB_PATH,
-        timeout=30,
-        isolation_level=None,
-    )
-    conn.row_factory = sqlite3.Row
-    conn.execute("pragma journal_mode=WAL")
-    conn.execute("pragma synchronous=NORMAL")
-    conn.execute("pragma busy_timeout=30000")
-    return conn
-
-
-def init_outbox_db_sync():
-    conn = db_connect()
+async def send_comment_to_node(payload: dict):
     try:
-        conn.execute(
-            """
-            create table if not exists outbox_events (
-                id text primary key,
-                event_type text not null,
-                payload_json text not null,
-                attempts integer not null default 0,
-                last_error text,
-                created_at text not null,
-                updated_at text not null,
-                delivered_at text
-            )
-            """
-        )
-        conn.execute(
-            "create index if not exists idx_outbox_pending on outbox_events(delivered_at, created_at)"
-        )
-        conn.execute(
-            "create index if not exists idx_outbox_attempts on outbox_events(delivered_at, attempts, created_at)"
-        )
-    finally:
-        conn.close()
-
-
-async def init_outbox_db():
-    await asyncio.to_thread(init_outbox_db_sync)
-
-
-def enqueue_outbox_event_sync(event_type: str, payload: dict):
-    event_id = str(payload.get("eventId") or str(uuid.uuid4()))
-    now = now_iso()
-    payload_json = json.dumps(payload, ensure_ascii=False, default=str)
-
-    conn = db_connect()
-    try:
-        # Idempotent insert. Nếu event đã tồn tại nhưng chưa gửi, cập nhật payload mới nhất
-        # và giữ attempts để worker tiếp tục retry. Nếu đã delivered rồi thì không tạo lại.
-        conn.execute(
-            """
-            insert into outbox_events (
-                id,
-                event_type,
-                payload_json,
-                attempts,
-                created_at,
-                updated_at
-            ) values (?, ?, ?, 0, ?, ?)
-            on conflict(id) do update set
-                payload_json = excluded.payload_json,
-                event_type = excluded.event_type,
-                updated_at = excluded.updated_at
-            where outbox_events.delivered_at is null
-            """,
-            (event_id, event_type, payload_json, now, now),
-        )
-    finally:
-        conn.close()
-
-
-async def enqueue_outbox_event(event_type: str, payload: dict):
-    if event_type != "COMMENT" and not NODE_EVENT_INGEST_URL:
-        # Không cấu hình event URL thì bỏ qua status event để outbox không bị pending mãi.
-        return
-
-    await asyncio.to_thread(enqueue_outbox_event_sync, event_type, payload)
-
-    if event_type == "COMMENT":
+        await post_to_node("COMMENT", payload)
         metrics["total_comments_enqueued"] += 1
+        metrics["total_node_sent"] += 1
+        log("COMMENT SENT TO NODE", "| eventId:", payload.get("eventId"))
+    except Exception as exc:
+        metrics["total_node_send_error"] += 1
+        log("COMMENT SEND ERROR", "| eventId:", payload.get("eventId"), "| error:", exc)
 
 
-def fetch_pending_events_sync(limit: int) -> list[dict]:
-    conn = db_connect()
-    try:
-        query = """
-            select *
-            from outbox_events
-            where delivered_at is null
-        """
-        params: list[Any] = []
-
-        if OUTBOX_MAX_ATTEMPTS > 0:
-            query += " and attempts < ?"
-            params.append(OUTBOX_MAX_ATTEMPTS)
-
-        query += " order by created_at asc limit ?"
-        params.append(limit)
-
-        rows = conn.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        conn.close()
-
-
-def mark_event_delivered_sync(event_id: str):
-    conn = db_connect()
-    try:
-        conn.execute(
-            """
-            update outbox_events
-            set delivered_at = ?, updated_at = ?
-            where id = ?
-            """,
-            (now_iso(), now_iso(), event_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def mark_event_failed_sync(event_id: str, error: str):
-    conn = db_connect()
-    try:
-        conn.execute(
-            """
-            update outbox_events
-            set attempts = attempts + 1,
-                last_error = ?,
-                updated_at = ?
-            where id = ?
-            """,
-            (str(error)[:1000], now_iso(), event_id),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def get_outbox_stats_sync() -> dict:
-    conn = db_connect()
-    try:
-        pending = conn.execute(
-            "select count(*) as value from outbox_events where delivered_at is null"
-        ).fetchone()["value"]
-        delivered = conn.execute(
-            "select count(*) as value from outbox_events where delivered_at is not null"
-        ).fetchone()["value"]
-        failed = conn.execute(
-            "select count(*) as value from outbox_events where delivered_at is null and attempts > 0"
-        ).fetchone()["value"]
-        return {"pending": pending, "delivered": delivered, "failed": failed}
-    finally:
-        conn.close()
-
-
-async def get_outbox_stats() -> dict:
-    return await asyncio.to_thread(get_outbox_stats_sync)
-
-
-# =========================
-# NODE POST
-# =========================
-
+async def get_outbox_stats():
+    return {
+        "enabled": False,
+        "dbPath": None,
+    }
 
 def post_json_sync(url: str, payload: dict) -> dict:
     if not url:
@@ -1119,44 +958,6 @@ async def send_realtime_live_event(event_type: str, payload: dict):
         log("LIVE EVENT SEND ERROR", "| eventType:", event_type, "| error:", exc)
 
 
-async def delivery_worker():
-    log("NODE DELIVERY WORKER STARTED")
-
-    while True:
-        try:
-            rows = await asyncio.to_thread(fetch_pending_events_sync, OUTBOX_BATCH_SIZE)
-
-            if not rows:
-                await asyncio.sleep(OUTBOX_RETRY_INTERVAL)
-                continue
-
-            for row in rows:
-                event_id = row["id"]
-                event_type = row["event_type"]
-
-                try:
-                    payload = json.loads(row["payload_json"])
-                    await post_to_node(event_type, payload)
-                    await asyncio.to_thread(mark_event_delivered_sync, event_id)
-                    metrics["total_node_sent"] += 1
-
-                    if event_type == "COMMENT":
-                        log("COMMENT SENT TO NODE", "| eventId:", event_id)
-
-                except Exception as error:
-                    await asyncio.to_thread(mark_event_failed_sync, event_id, str(error))
-                    metrics["total_node_send_error"] += 1
-                    log("SEND TO NODE ERROR", "| eventId:", event_id, "| error:", error)
-
-            await asyncio.sleep(0.05)
-
-        except asyncio.CancelledError:
-            log("NODE DELIVERY WORKER CANCELLED")
-            raise
-        except Exception as error:
-            log("NODE DELIVERY WORKER ERROR:", error)
-            await asyncio.sleep(OUTBOX_RETRY_INTERVAL)
-
 
 # =========================
 # ROOM / COLLECTOR
@@ -1176,7 +977,7 @@ async def enqueue_live_event(room: TikTokRoom, event_type: str, payload: dict):
         "createdAt": now_iso(),
         **payload,
     }
-    await enqueue_outbox_event(event_type, envelope)
+    await send_realtime_live_event(event_type, envelope)
 
 
 def upsert_latest_comment(room: TikTokRoom, payload: dict):
@@ -1439,10 +1240,10 @@ def create_tiktok_client_for_room(room: TikTokRoom) -> TikTokLiveClient:
         metrics["comment_timestamps"].append(time.time())
         metrics["comment_timestamps"] = metrics["comment_timestamps"][-10000:]
 
-        await enqueue_outbox_event("COMMENT", payload)
+        await send_comment_to_node(payload)
 
         log("======================================")
-        log("NEW COMMENT QUEUED TO NODE")
+        log("NEW COMMENT SENT TO NODE")
         log("Live room:", username)
         log("Shop ID:", room.shop_id or "(empty)")
         log("Display name:", display_name)
@@ -1787,25 +1588,13 @@ async def metrics_route(_: bool = Depends(require_control_api_key)):
 
 @app.on_event("startup")
 async def on_startup():
-    global delivery_task
-
-    await init_outbox_db()
-    delivery_task = asyncio.create_task(delivery_worker())
-
     if AUTO_START_USERNAME:
         await start_room(AUTO_START_USERNAME)
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global delivery_task
-
     await stop_all_rooms()
-
-    if delivery_task and not delivery_task.done():
-        delivery_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await delivery_task
 
 
 if __name__ == "__main__":
